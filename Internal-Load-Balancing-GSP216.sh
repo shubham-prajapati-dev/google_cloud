@@ -3,8 +3,7 @@ set -Eeuo pipefail
 trap 'echo "ERROR: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
-[[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "ERROR: Set the lab project first: gcloud config set project PROJECT_ID"; exit 1; }
-
+[[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "ERROR: Set the lab project first."; exit 1; }
 DEFAULT_REGION="$(gcloud config get-value compute/region 2>/dev/null || true)"
 DEFAULT_ZONE="$(gcloud config get-value compute/zone 2>/dev/null || true)"
 [[ "$DEFAULT_REGION" == "(unset)" ]] && DEFAULT_REGION=""
@@ -12,290 +11,123 @@ DEFAULT_ZONE="$(gcloud config get-value compute/zone 2>/dev/null || true)"
 DEFAULT_REGION="${DEFAULT_REGION:-us-central1}"
 DEFAULT_ZONE="${DEFAULT_ZONE:-us-central1-a}"
 
-printf '\n============================================================\n'
-printf ' GSP216 - Internal Load Balancing Lab\n'
-printf '============================================================\n'
-printf 'Project: %s\n\n' "$PROJECT_ID"
-
+echo "============================================================"
+echo " GSP216 - SQL: BigQuery and Cloud SQL"
+echo "============================================================"
+echo "Project: $PROJECT_ID"
+echo
 read -r -p "Enter Region [$DEFAULT_REGION]: " REGION
 REGION="${REGION:-$DEFAULT_REGION}"
-read -r -p "Enter Zone for subnet-a [$DEFAULT_ZONE]: " ZONE_A
-ZONE_A="${ZONE_A:-$DEFAULT_ZONE}"
-read -r -p "Enter a different zone in the same region for subnet-b [auto]: " ZONE_B
-if [[ -z "$ZONE_B" ]]; then
-  ZONE_B="$(gcloud compute zones list --filter="region:($REGION) AND name!=$ZONE_A" --format='value(name)' --limit=1)"
-fi
-[[ -n "$ZONE_B" ]] || { echo "ERROR: Could not find a second zone in $REGION."; exit 1; }
+read -r -p "Enter Lab Zone [$DEFAULT_ZONE]: " ZONE
+ZONE="${ZONE:-$DEFAULT_ZONE}"
+BQ_LOCATION="US"
+BUCKET="$PROJECT_ID"
+SQL_INSTANCE="my-demo"
+SQL_PASSWORD='ChangeMe1!'
+DATASET="gsp216_sql"
+START_TABLE="start_station_counts"
+END_TABLE="end_station_counts"
+START_CSV="start_station_data.csv"
+END_CSV="end_station_data.csv"
+exists() { "$@" >/dev/null 2>&1; }
 
-printf '\nRegion: %s\nZone A: %s\nZone B: %s\n\n' "$REGION" "$ZONE_A" "$ZONE_B"
+printf '\nRegion: %s\nZone: %s\n\n' "$REGION" "$ZONE"
 read -r -p "Continue? [Y/n]: " CONFIRM
 CONFIRM="${CONFIRM:-Y}"
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
-NETWORK="my-internal-app"
-SUBNET_A="subnet-a"
-SUBNET_B="subnet-b"
-TEMPLATE_1="instance-template-1"
-TEMPLATE_2="instance-template-2"
-MIG_1="instance-group-1"
-MIG_2="instance-group-2"
-UTILITY="utility-vm"
-ILB="my-ilb"
-ILB_IP_NAME="my-ilb-ip"
-ILB_IP="10.10.30.5"
-HEALTH_CHECK="my-ilb-health-check"
-BACKEND_SERVICE="my-ilb-backend-service"
-
-exists() { "$@" >/dev/null 2>&1; }
-
-require_network_and_subnets() {
-  exists gcloud compute networks describe "$NETWORK" || {
-    echo "ERROR: Required network '$NETWORK' was not found. Start the lab first." >&2
-    exit 1
-  }
-  exists gcloud compute networks subnets describe "$SUBNET_A" --region="$REGION" || {
-    echo "ERROR: Required subnet '$SUBNET_A' was not found in $REGION." >&2
-    exit 1
-  }
-  exists gcloud compute networks subnets describe "$SUBNET_B" --region="$REGION" || {
-    echo "ERROR: Required subnet '$SUBNET_B' was not found in $REGION." >&2
-    exit 1
-  }
-}
-
-ensure_firewall() {
-  local NAME="$1"; shift
-  if exists gcloud compute firewall-rules describe "$NAME"; then
-    echo "✓ Firewall exists: $NAME"
-  else
-    gcloud compute firewall-rules create "$NAME" "$@"
-  fi
-}
-
-# IMPORTANT: use --metadata-from-file instead of --metadata=startup-script=...
-# because gcloud parses commas, colons and spaces in PHP/curl code as dict syntax.
-create_startup_file() {
-  cat > /tmp/gsp216-startup.sh <<'STARTUP'
-#!/bin/bash
-apt-get update
-apt-get install -y apache2 php libapache2-mod-php curl
-cat <<'HTML' > /var/www/html/index.php
-<h1>Internal Load Balancing Lab</h1>
-<h2>Client IP</h2>
-Your IP address : <?php echo $_SERVER['REMOTE_ADDR']; ?>
-<h2>Hostname</h2>
-Server Hostname: <?php echo gethostname(); ?>
-<h2>Server Location</h2>
-Region and Zone: <?php
-$ch = curl_init();
-curl_setopt($ch, CURLOPT_URL, 'http://metadata.google.internal/computeMetadata/v1/instance/zone');
-curl_setopt($ch, CURLOPT_HTTPHEADER, array('Metadata-Flavor: Google'));
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-$zone = curl_exec($ch);
-$parts = explode('/', $zone);
-echo end($parts);
-?>
-HTML
-rm -f /var/www/html/index.html
-systemctl enable apache2
-systemctl restart apache2
-STARTUP
-  chmod 644 /tmp/gsp216-startup.sh
-}
-
-ensure_template() {
-  local NAME="$1" SUBNET="$2"
-  if exists gcloud compute instance-templates describe "$NAME"; then
-    echo "✓ Instance template exists: $NAME"
-    return
-  fi
-  gcloud compute instance-templates create "$NAME" \
-    --machine-type=e2-micro \
-    --network="$NETWORK" \
-    --subnet="$SUBNET" \
-    --no-address \
-    --tags=lb-backend \
-    --image-family=debian-11 \
-    --image-project=debian-cloud \
-    --metadata-from-file=startup-script=/tmp/gsp216-startup.sh
-}
-
-ensure_mig() {
-  local NAME="$1" TEMPLATE="$2" ZONE="$3"
-  if exists gcloud compute instance-groups managed describe "$NAME" --zone="$ZONE"; then
-    echo "✓ Managed instance group exists: $NAME"
-  else
-    gcloud compute instance-groups managed create "$NAME" \
-      --template="$TEMPLATE" \
-      --size=1 \
-      --zone="$ZONE"
-  fi
-  gcloud compute instance-groups managed set-autoscaling "$NAME" \
-    --zone="$ZONE" \
-    --min-num-replicas=1 \
-    --max-num-replicas=1 \
-    --target-cpu-utilization=0.8 \
-    --cool-down-period=45
-}
-
-# Validate lab-provided resources.
-echo "Validating project, region, zones and pre-created network..."
+echo "Validating project, region and zone..."
 gcloud projects describe "$PROJECT_ID" >/dev/null
 gcloud compute regions describe "$REGION" >/dev/null
-gcloud compute zones describe "$ZONE_A" >/dev/null
-gcloud compute zones describe "$ZONE_B" >/dev/null
-require_network_and_subnets
+gcloud compute zones describe "$ZONE" >/dev/null
 gcloud config set compute/region "$REGION" >/dev/null
-gcloud config set compute/zone "$ZONE_A" >/dev/null
+gcloud config set compute/zone "$ZONE" >/dev/null
 
-# ============================================================
-# TASK 1 - Configure HTTP and health check firewall rules
-# ============================================================
 echo
-echo "[TASK 1] Configuring firewall rules..."
-ensure_firewall app-allow-http \
-  --network="$NETWORK" \
-  --action=allow \
-  --direction=INGRESS \
-  --target-tags=lb-backend \
-  --source-ranges=10.10.0.0/16 \
-  --rules=tcp:80
+echo "[BIGQUERY] Running the lab queries..."
+if ! exists bq show "${PROJECT_ID}:${DATASET}"; then
+  bq --location="$BQ_LOCATION" mk --dataset "$PROJECT_ID:$DATASET"
+fi
+bq query --use_legacy_sql=false --location="$BQ_LOCATION" --replace --destination_table="$PROJECT_ID:$DATASET.$START_TABLE" 'SELECT start_station_name, COUNT(*) AS num FROM `bigquery-public-data.london_bicycles.cycle_hire` GROUP BY start_station_name ORDER BY num DESC'
+bq query --use_legacy_sql=false --location="$BQ_LOCATION" --replace --destination_table="$PROJECT_ID:$DATASET.$END_TABLE" 'SELECT end_station_name, COUNT(*) AS num FROM `bigquery-public-data.london_bicycles.cycle_hire` GROUP BY end_station_name ORDER BY num DESC'
+echo "✓ BigQuery query results created"
 
-ensure_firewall app-allow-health-check \
-  --network="$NETWORK" \
-  --action=allow \
-  --direction=INGRESS \
-  --target-tags=lb-backend \
-  --source-ranges=130.211.0.0/22,35.191.0.0/16 \
-  --rules=tcp
-
-echo "✓ TASK 1 configured"
-
-# ============================================================
-# TASK 2 - Configure instance templates and instance groups
-# ============================================================
 echo
-echo "[TASK 2] Creating instance templates..."
-create_startup_file
-ensure_template "$TEMPLATE_1" "$SUBNET_A"
-ensure_template "$TEMPLATE_2" "$SUBNET_B"
-ensure_mig "$MIG_1" "$TEMPLATE_1" "$ZONE_A"
-ensure_mig "$MIG_2" "$TEMPLATE_2" "$ZONE_B"
+echo "[STORAGE] Creating bucket and exporting CSV files..."
+if exists gcloud storage buckets describe "gs://$BUCKET"; then
+  echo "✓ Bucket exists: $BUCKET"
+else
+  gcloud storage buckets create "gs://$BUCKET" --location=US
+fi
+if exists gcloud storage objects describe "gs://$BUCKET/$START_CSV"; then gcloud storage rm "gs://$BUCKET/$START_CSV" --quiet; fi
+if exists gcloud storage objects describe "gs://$BUCKET/$END_CSV"; then gcloud storage rm "gs://$BUCKET/$END_CSV" --quiet; fi
+bq extract --location="$BQ_LOCATION" --destination_format=CSV --print_header=true "$PROJECT_ID:$DATASET.$START_TABLE" "gs://$BUCKET/$START_CSV"
+bq extract --location="$BQ_LOCATION" --destination_format=CSV --print_header=true "$PROJECT_ID:$DATASET.$END_TABLE" "gs://$BUCKET/$END_CSV"
+echo "✓ CSV files exported"
 
-echo "✓ TASK 2 configured"
-
-# ============================================================
-# Utility VM used to test the internal load balancer
-# ============================================================
 echo
-echo "Creating utility VM..."
-if exists gcloud compute instances describe "$UTILITY" --zone="$ZONE_A"; then
-  echo "✓ Utility VM exists: $UTILITY"
+echo "[CLOUD SQL] Creating MySQL instance..."
+if exists gcloud sql instances describe "$SQL_INSTANCE"; then
+  echo "✓ Cloud SQL instance exists: $SQL_INSTANCE"
 else
-  gcloud compute instances create "$UTILITY" \
-    --zone="$ZONE_A" \
-    --machine-type=e2-micro \
-    --network="$NETWORK" \
-    --subnet="$SUBNET_A" \
-    --no-address \
-    --private-network-ip=10.10.20.50 \
-    --image-family=debian-11 \
-    --image-project=debian-cloud
+  gcloud sql instances create "$SQL_INSTANCE" --database-version=MYSQL_8_0 --edition=ENTERPRISE --tier=db-custom-4-16384 --storage-type=SSD --storage-size=100 --availability-type=REGIONAL --zone="$ZONE" --root-password="$SQL_PASSWORD"
 fi
+for i in {1..36}; do
+  STATE="$(gcloud sql instances describe "$SQL_INSTANCE" --format='value(state)')"
+  [[ "$STATE" == "RUNNABLE" ]] && break
+  echo "Waiting for Cloud SQL instance... state=$STATE"
+  sleep 10
+done
+STATE="$(gcloud sql instances describe "$SQL_INSTANCE" --format='value(state)')"
+[[ "$STATE" == "RUNNABLE" ]] || { echo "ERROR: Cloud SQL instance did not become RUNNABLE." >&2; exit 1; }
+echo "✓ Cloud SQL instance is RUNNABLE"
 
-# ============================================================
-# TASK 3 - Configure the Internal Load Balancer
-# ============================================================
 echo
-echo "[TASK 3] Configuring Internal Load Balancer..."
-
-if exists gcloud compute addresses describe "$ILB_IP_NAME" --region="$REGION"; then
-  CURRENT_IP="$(gcloud compute addresses describe "$ILB_IP_NAME" --region="$REGION" --format='value(address)')"
-  [[ "$CURRENT_IP" == "$ILB_IP" ]] || {
-    echo "ERROR: $ILB_IP_NAME exists with $CURRENT_IP, expected $ILB_IP." >&2
-    exit 1
-  }
-  echo "✓ Internal IP exists: $ILB_IP_NAME ($CURRENT_IP)"
+echo "[CLOUD SQL] Creating database and tables..."
+if gcloud sql databases list --instance="$SQL_INSTANCE" --format='value(name)' | grep -qx 'bike'; then
+  echo "✓ Database exists: bike"
 else
-  gcloud compute addresses create "$ILB_IP_NAME" \
-    --region="$REGION" \
-    --subnet="$SUBNET_B" \
-    --addresses="$ILB_IP"
+  gcloud sql databases create bike --instance="$SQL_INSTANCE"
 fi
+SQL_SA="$(gcloud sql instances describe "$SQL_INSTANCE" --format='value(serviceAccountEmailAddress)')"
+[[ -n "$SQL_SA" ]] || { echo "ERROR: Could not determine Cloud SQL service account." >&2; exit 1; }
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SQL_SA" --role="roles/storage.objectViewer" >/dev/null
+export MYSQL_PWD="$SQL_PASSWORD"
+gcloud sql connect "$SQL_INSTANCE" --user=root --quiet <<'SQL'
+USE bike;
+CREATE TABLE IF NOT EXISTS london1 (start_station_name VARCHAR(255), num INT);
+CREATE TABLE IF NOT EXISTS london2 (end_station_name VARCHAR(255), num INT);
+SQL
 
-if exists gcloud compute health-checks describe "$HEALTH_CHECK" --region="$REGION"; then
-  echo "✓ Health check exists: $HEALTH_CHECK"
-else
-  gcloud compute health-checks create tcp "$HEALTH_CHECK" \
-    --region="$REGION" \
-    --port=80
-fi
-
-if exists gcloud compute backend-services describe "$BACKEND_SERVICE" --region="$REGION"; then
-  echo "✓ Backend service exists: $BACKEND_SERVICE"
-else
-  gcloud compute backend-services create "$BACKEND_SERVICE" \
-    --region="$REGION" \
-    --load-balancing-scheme=internal \
-    --protocol=tcp \
-    --health-checks="$HEALTH_CHECK"
-fi
-
-BACKENDS="$(gcloud compute backend-services describe "$BACKEND_SERVICE" --region="$REGION" --format='value(backends[].group)' 2>/dev/null || true)"
-MIG1_URL="https://www.googleapis.com/compute/v1/projects/$PROJECT_ID/zones/$ZONE_A/instanceGroups/$MIG_1"
-MIG2_URL="https://www.googleapis.com/compute/v1/projects/$PROJECT_ID/zones/$ZONE_B/instanceGroups/$MIG_2"
-
-if ! grep -Fq "$MIG1_URL" <<< "$BACKENDS"; then
-  gcloud compute backend-services add-backend "$BACKEND_SERVICE" \
-    --region="$REGION" \
-    --instance-group="$MIG_1" \
-    --instance-group-zone="$ZONE_A"
-fi
-
-if ! grep -Fq "$MIG2_URL" <<< "$BACKENDS"; then
-  gcloud compute backend-services add-backend "$BACKEND_SERVICE" \
-    --region="$REGION" \
-    --instance-group="$MIG_2" \
-    --instance-group-zone="$ZONE_B"
-fi
-
-if exists gcloud compute forwarding-rules describe "$ILB" --region="$REGION"; then
-  RULE_IP="$(gcloud compute forwarding-rules describe "$ILB" --region="$REGION" --format='value(IPAddress)')"
-  RULE_BACKEND="$(gcloud compute forwarding-rules describe "$ILB" --region="$REGION" --format='value(backendService.basename())')"
-  [[ "$RULE_IP" == "$ILB_IP" ]] || { echo "ERROR: $ILB uses IP $RULE_IP, expected $ILB_IP"; exit 1; }
-  [[ "$RULE_BACKEND" == "$BACKEND_SERVICE" ]] || { echo "ERROR: $ILB points to $RULE_BACKEND, expected $BACKEND_SERVICE"; exit 1; }
-  echo "✓ Forwarding rule exists: $ILB"
-else
-  gcloud compute forwarding-rules create "$ILB" \
-    --region="$REGION" \
-    --load-balancing-scheme=internal \
-    --network="$NETWORK" \
-    --subnet="$SUBNET_B" \
-    --address="$ILB_IP_NAME" \
-    --ip-protocol=TCP \
-    --ports=80 \
-    --backend-service="$BACKEND_SERVICE"
-fi
-
-echo "✓ TASK 3 configured"
-
-# ============================================================
-# TASK 4 - Test
-# ============================================================
 echo
-echo "[TASK 4] Waiting for backend instances to initialize..."
-sleep 15
+echo "[CLOUD SQL] Importing CSV files..."
+gcloud sql import csv "gs://$BUCKET/$START_CSV" "$SQL_INSTANCE" --database=bike --table=london1 --quiet
+gcloud sql import csv "gs://$BUCKET/$END_CSV" "$SQL_INSTANCE" --database=bike --table=london2 --quiet
+echo "✓ CSV files imported"
 
-printf '\n============================================================\n'
-printf ' SUCCESS - GSP216 resources configured\n'
-printf '============================================================\n'
-printf 'Region:        %s\n' "$REGION"
-printf 'Zone A:        %s\n' "$ZONE_A"
-printf 'Zone B:        %s\n' "$ZONE_B"
-printf 'Internal LB:   %s (%s)\n' "$ILB" "$ILB_IP"
-printf 'Backend groups: %s, %s\n' "$MIG_1" "$MIG_2"
-printf '\nTest from utility-vm:\n'
-printf '  gcloud compute ssh %s --zone=%s\n' "$UTILITY" "$ZONE_A"
-printf '  curl %s\n' "$ILB_IP"
-printf '\nRun "Check my progress" in the lab after the backends become healthy.\n'
-printf '============================================================\n'
+echo
+echo "[CLOUD SQL] Running final lab queries..."
+gcloud sql connect "$SQL_INSTANCE" --user=root --quiet <<'SQL'
+USE bike;
+DELETE FROM london1 WHERE num=0;
+DELETE FROM london2 WHERE num=0;
+INSERT INTO london1 (start_station_name, num) VALUES ("test destination", 1);
+SELECT start_station_name AS top_stations, num FROM london1 WHERE num>100000
+UNION
+SELECT end_station_name, num FROM london2 WHERE num>100000
+ORDER BY top_stations DESC;
+SQL
+unset MYSQL_PWD
+
+echo
+echo "============================================================"
+echo " SUCCESS - GSP216 SQL lab configured"
+echo "============================================================"
+echo "Project:       $PROJECT_ID"
+echo "Bucket:        gs://$BUCKET"
+echo "Cloud SQL:     $SQL_INSTANCE"
+echo "Database:      bike"
+echo "Tables:        london1, london2"
+echo
+echo "Now click 'Check my progress' in the lab."
+echo "============================================================"
