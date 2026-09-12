@@ -1,21 +1,27 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Google Cloud Skills Boost Challenge Lab
-# Interactive setup: asks for Region, Zone, and Debian image family.
+# Google Cloud Skills Boost - Load Balancing Challenge Lab
+# Creates all resources for Tasks 1, 2 and 3.
+# Region, Zone and Debian image family are requested from the user.
+
+trap 'echo "ERROR: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+[[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "ERROR: Set your Google Cloud project first: gcloud config set project PROJECT_ID"; exit 1; }
+
+default_region="$(gcloud config get-value compute/region 2>/dev/null || true)"
+default_zone="$(gcloud config get-value compute/zone 2>/dev/null || true)"
+[[ "$default_region" == "(unset)" ]] && default_region=""
+[[ "$default_zone" == "(unset)" ]] && default_zone=""
+default_region="${default_region:-us-central1}"
+default_zone="${default_zone:-us-central1-a}"
 
 echo "============================================================"
 echo " Google Cloud Load Balancing Challenge Lab"
 echo "============================================================"
-
-default_region="$(gcloud config get-value compute/region 2>/dev/null || true)"
-default_zone="$(gcloud config get-value compute/zone 2>/dev/null || true)"
-
-[[ "$default_region" == "(unset)" ]] && default_region=""
-[[ "$default_zone" == "(unset)" ]] && default_zone=""
-
-default_region="${default_region:-us-central1}"
-default_zone="${default_zone:-us-central1-a}"
+echo "Project: $PROJECT_ID"
+echo
 
 read -r -p "Enter Region [$default_region]: " REGION
 REGION="${REGION:-$default_region}"
@@ -29,8 +35,11 @@ IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
 IMAGE_PROJECT="debian-cloud"
 NETWORK="default"
 
+# Required lab resource names
 NETWORK_LB_IP_NAME="network-lb-ip-1"
 TARGET_POOL="www-pool"
+NETWORK_LB_RULE="www-rule"
+OLD_NETWORK_LB_RULE="www-pool-forwarding-rule"
 FW_NETWORK_LB="www-firewall-network-lb"
 TEMPLATE="lb-backend-template"
 MIG="lb-backend-group"
@@ -42,154 +51,241 @@ URL_MAP="web-map-http"
 HTTP_PROXY="http-lb-proxy"
 FORWARDING="http-content-rule"
 
-run_create() {
-  if "$@"; then
-    return 0
-  fi
-  echo "Resource/command may already exist; continuing..."
-  return 0
-}
-
-echo
-printf '%s\n' "Region: $REGION"
-printf '%s\n' "Zone:   $ZONE"
-printf '%s\n' "Image:  $IMAGE_FAMILY ($IMAGE_PROJECT)"
-printf '%s\n' "Network: $NETWORK"
-echo
+printf '\nRegion: %s\nZone: %s\nDebian image: %s\nNetwork: %s\n\n' "$REGION" "$ZONE" "$IMAGE_FAMILY" "$NETWORK"
 read -r -p "Continue with these values? [Y/n]: " CONFIRM
 CONFIRM="${CONFIRM:-Y}"
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
-gcloud config set compute/region "$REGION"
-gcloud config set compute/zone "$ZONE"
+# Validate the supplied location/image before creating resources.
+echo "Validating project, zone and Debian image..."
+gcloud projects describe "$PROJECT_ID" >/dev/null
+gcloud compute zones describe "$ZONE" >/dev/null
+gcloud compute regions describe "$REGION" >/dev/null
+gcloud compute images describe "$IMAGE_FAMILY" --project="$IMAGE_PROJECT" >/dev/null 2>&1 || \
+  gcloud compute images describe "$(gcloud compute images list --project="$IMAGE_PROJECT" --filter="family=$IMAGE_FAMILY" --format='value(name)' --limit=1)" --project="$IMAGE_PROJECT" >/dev/null
 
-# TASK 1: Three web servers
+gcloud config set compute/region "$REGION" >/dev/null
+gcloud config set compute/zone "$ZONE" >/dev/null
+
+exists() {
+  "$@" >/dev/null 2>&1
+}
+
+ensure_firewall() {
+  local name="$1"; shift
+  if exists gcloud compute firewall-rules describe "$name"; then
+    echo "✓ Firewall exists: $name"
+  else
+    gcloud compute firewall-rules create "$name" "$@"
+  fi
+}
+
+# ------------------------------------------------------------
+# TASK 1: Create web1, web2 and web3
+# ------------------------------------------------------------
 create_web_vm() {
   local name="$1"
-  run_create gcloud compute instances create "$name" \
+  if exists gcloud compute instances describe "$name" --zone="$ZONE"; then
+    echo "✓ VM exists: $name"
+    return
+  fi
+
+  gcloud compute instances create "$name" \
     --zone="$ZONE" \
     --network="$NETWORK" \
     --tags=network-lb-tag \
     --machine-type=e2-small \
     --image-family="$IMAGE_FAMILY" \
     --image-project="$IMAGE_PROJECT" \
-    --metadata=startup-script="#!/bin/bash
+    --metadata=startup-script="#/bin/bash
 apt-get update
-apt-get install apache2 -y
-service apache2 restart
-echo \"<h3>Web Server: $name</h3>\" | tee /var/www/html/index.html"
+apt-get install -y apache2
+echo '<h3>Web Server: $name</h3>' > /var/www/html/index.html
+systemctl enable --now apache2"
 }
 
 create_web_vm web1
 create_web_vm web2
 create_web_vm web3
 
-run_create gcloud compute firewall-rules create "$FW_NETWORK_LB" \
+ensure_firewall "$FW_NETWORK_LB" \
   --network="$NETWORK" \
   --target-tags=network-lb-tag \
-  --allow=tcp:80
+  --direction=INGRESS \
+  --action=ALLOW \
+  --rules=tcp:80
 
+# ------------------------------------------------------------
 # TASK 2: Network Load Balancer
-run_create gcloud compute addresses create "$NETWORK_LB_IP_NAME" \
-  --region="$REGION"
+# Required: network-lb-ip-1 -> www-pool -> TCP/80
+# ------------------------------------------------------------
+if exists gcloud compute addresses describe "$NETWORK_LB_IP_NAME" --region="$REGION"; then
+  echo "✓ Regional IP exists: $NETWORK_LB_IP_NAME"
+else
+  gcloud compute addresses create "$NETWORK_LB_IP_NAME" --region="$REGION"
+fi
 
-run_create gcloud compute target-pools create "$TARGET_POOL" \
-  --region="$REGION"
+if exists gcloud compute target-pools describe "$TARGET_POOL" --region="$REGION"; then
+  echo "✓ Target pool exists: $TARGET_POOL"
+else
+  gcloud compute target-pools create "$TARGET_POOL" --region="$REGION"
+fi
 
-run_create gcloud compute target-pools add-instances "$TARGET_POOL" \
+gcloud compute target-pools add-instances "$TARGET_POOL" \
   --instances=web1,web2,web3 \
   --instances-zone="$ZONE" \
-  --region="$REGION"
+  --region="$REGION" 2>/dev/null || true
 
-NETWORK_LB_IP="$(gcloud compute addresses describe "$NETWORK_LB_IP_NAME" \
-  --region="$REGION" --format='get(address)')"
+# Remove the older incorrectly named forwarding rule if it exists.
+if exists gcloud compute forwarding-rules describe "$OLD_NETWORK_LB_RULE" --region="$REGION"; then
+  echo "Removing old forwarding rule: $OLD_NETWORK_LB_RULE"
+  gcloud compute forwarding-rules delete "$OLD_NETWORK_LB_RULE" --region="$REGION" --quiet
+fi
 
-echo "Network Load Balancer IP: $NETWORK_LB_IP"
+# Recreate the Task 2 forwarding rule so its configuration is guaranteed.
+if exists gcloud compute forwarding-rules describe "$NETWORK_LB_RULE" --region="$REGION"; then
+  gcloud compute forwarding-rules delete "$NETWORK_LB_RULE" --region="$REGION" --quiet
+fi
 
-run_create gcloud compute forwarding-rules create "$TARGET_POOL-forwarding-rule" \
+gcloud compute forwarding-rules create "$NETWORK_LB_RULE" \
   --region="$REGION" \
-  --ports=80 \
   --address="$NETWORK_LB_IP_NAME" \
+  --ports=80 \
   --target-pool="$TARGET_POOL"
 
-# TASK 3: HTTP Load Balancer
-run_create gcloud compute instance-templates create "$TEMPLATE" \
-  --region="$REGION" \
-  --network="$NETWORK" \
-  --subnet=default \
-  --tags=allow-health-check \
-  --machine-type=e2-medium \
-  --image-family="$IMAGE_FAMILY" \
-  --image-project="$IMAGE_PROJECT" \
-  --metadata=startup-script='#!/bin/bash
-apt-get update
-apt-get install apache2 -y
-a2ensite default-ssl
-a2enmod ssl
-vm_hostname="$(curl -H "Metadata-Flavor:Google" http://169.254.169.254/computeMetadata/v1/instance/name)"
-echo "Page served from: $vm_hostname" | tee /var/www/html/index.html
-systemctl restart apache2'
+NETWORK_LB_IP="$(gcloud compute addresses describe "$NETWORK_LB_IP_NAME" --region="$REGION" --format='value(address)')"
 
-run_create gcloud compute instance-groups managed create "$MIG" \
-  --template="$TEMPLATE" \
-  --size=2 \
+# Verify Task 2 resources before continuing.
+gcloud compute target-pools describe "$TARGET_POOL" --region="$REGION" >/dev/null
+gcloud compute forwarding-rules describe "$NETWORK_LB_RULE" --region="$REGION" >/dev/null
+
+# ------------------------------------------------------------
+# TASK 3: Global HTTP Load Balancer
+# ------------------------------------------------------------
+if exists gcloud compute instance-templates describe "$TEMPLATE"; then
+  echo "✓ Instance template exists: $TEMPLATE"
+else
+  gcloud compute instance-templates create "$TEMPLATE" \
+    --network="$NETWORK" \
+    --subnet=default \
+    --tags=allow-health-check \
+    --machine-type=e2-medium \
+    --image-family="$IMAGE_FAMILY" \
+    --image-project="$IMAGE_PROJECT" \
+    --metadata=startup-script='#!/bin/bash
+apt-get update
+apt-get install -y apache2
+HOSTNAME=$(curl -fsS -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
+echo "Page served from: $HOSTNAME" > /var/www/html/index.html
+systemctl enable --now apache2'
+fi
+
+if exists gcloud compute instance-groups managed describe "$MIG" --zone="$ZONE"; then
+  echo "✓ Managed instance group exists: $MIG"
+else
+  gcloud compute instance-groups managed create "$MIG" \
+    --template="$TEMPLATE" \
+    --size=2 \
+    --zone="$ZONE"
+fi
+
+# Required because the backend service uses the named port "http".
+gcloud compute instance-groups managed set-named-ports "$MIG" \
+  --named-ports=http:80 \
   --zone="$ZONE"
 
-run_create gcloud compute firewall-rules create "$FW_HEALTH" \
+ensure_firewall "$FW_HEALTH" \
   --network="$NETWORK" \
-  --action=allow \
-  --direction=ingress \
+  --direction=INGRESS \
+  --action=ALLOW \
   --source-ranges=130.211.0.0/22,35.191.0.0/16 \
   --target-tags=allow-health-check \
   --rules=tcp:80
 
-run_create gcloud compute addresses create "$LB_IP" \
-  --ip-version=IPV4 \
-  --global
+if exists gcloud compute addresses describe "$LB_IP" --global; then
+  echo "✓ Global IP exists: $LB_IP"
+else
+  gcloud compute addresses create "$LB_IP" --ip-version=IPV4 --global
+fi
 
-GLOBAL_LB_IP="$(gcloud compute addresses describe "$LB_IP" \
-  --global --format='get(address)')"
+if exists gcloud compute health-checks describe "$HEALTH_CHECK"; then
+  echo "✓ Health check exists: $HEALTH_CHECK"
+else
+  gcloud compute health-checks create http "$HEALTH_CHECK" --port=80
+fi
 
-echo "HTTP Load Balancer IP: $GLOBAL_LB_IP"
+if exists gcloud compute backend-services describe "$BACKEND" --global; then
+  echo "✓ Backend service exists: $BACKEND"
+else
+  gcloud compute backend-services create "$BACKEND" \
+    --protocol=HTTP \
+    --port-name=http \
+    --health-checks="$HEALTH_CHECK" \
+    --global
+fi
 
-run_create gcloud compute health-checks create http "$HEALTH_CHECK" \
-  --port=80
-
-run_create gcloud compute backend-services create "$BACKEND" \
-  --protocol=HTTP \
-  --port-name=http \
-  --health-checks="$HEALTH_CHECK" \
-  --global
-
-run_create gcloud compute backend-services add-backend "$BACKEND" \
+gcloud compute backend-services add-backend "$BACKEND" \
   --instance-group="$MIG" \
   --instance-group-zone="$ZONE" \
-  --global
+  --global 2>/dev/null || true
 
-run_create gcloud compute url-maps create "$URL_MAP" \
-  --default-service="$BACKEND"
+if exists gcloud compute url-maps describe "$URL_MAP"; then
+  echo "✓ URL map exists: $URL_MAP"
+else
+  gcloud compute url-maps create "$URL_MAP" --default-service="$BACKEND"
+fi
 
-run_create gcloud compute target-http-proxies create "$HTTP_PROXY" \
-  --url-map="$URL_MAP"
+if exists gcloud compute target-http-proxies describe "$HTTP_PROXY"; then
+  echo "✓ HTTP proxy exists: $HTTP_PROXY"
+else
+  gcloud compute target-http-proxies create "$HTTP_PROXY" --url-map="$URL_MAP"
+fi
 
-run_create gcloud compute forwarding-rules create "$FORWARDING" \
-  --address="$LB_IP" \
-  --global \
-  --target-http-proxy="$HTTP_PROXY" \
-  --ports=80
+if exists gcloud compute forwarding-rules describe "$FORWARDING" --global; then
+  echo "✓ Global forwarding rule exists: $FORWARDING"
+else
+  gcloud compute forwarding-rules create "$FORWARDING" \
+    --address="$LB_IP" \
+    --global \
+    --target-http-proxy="$HTTP_PROXY" \
+    --ports=80
+fi
 
+GLOBAL_LB_IP="$(gcloud compute addresses describe "$LB_IP" --global --format='value(address)')"
+
+# Final verification. The script stops if any required resource is missing.
 echo
+echo "Verifying required resources..."
+gcloud compute instances describe web1 --zone="$ZONE" >/dev/null
+gcloud compute instances describe web2 --zone="$ZONE" >/dev/null
+gcloud compute instances describe web3 --zone="$ZONE" >/dev/null
+gcloud compute addresses describe "$NETWORK_LB_IP_NAME" --region="$REGION" >/dev/null
+gcloud compute target-pools describe "$TARGET_POOL" --region="$REGION" >/dev/null
+gcloud compute forwarding-rules describe "$NETWORK_LB_RULE" --region="$REGION" >/dev/null
+gcloud compute instance-templates describe "$TEMPLATE" >/dev/null
+gcloud compute instance-groups managed describe "$MIG" --zone="$ZONE" >/dev/null
+gcloud compute health-checks describe "$HEALTH_CHECK" >/dev/null
+gcloud compute backend-services describe "$BACKEND" --global >/dev/null
+gcloud compute url-maps describe "$URL_MAP" >/dev/null
+gcloud compute target-http-proxies describe "$HTTP_PROXY" >/dev/null
+gcloud compute forwarding-rules describe "$FORWARDING" --global >/dev/null
+
 echo "============================================================"
-echo " Challenge Lab setup complete"
+echo " SUCCESS: Challenge Lab resources are configured"
 echo "============================================================"
-echo "Region:              $REGION"
-echo "Zone:                $ZONE"
-echo "Network LB IP:       $NETWORK_LB_IP"
-echo "HTTP Load Balancer:  $GLOBAL_LB_IP"
+echo "Project:              $PROJECT_ID"
+echo "Region:               $REGION"
+echo "Zone:                 $ZONE"
+echo "Network LB IP:        $NETWORK_LB_IP"
+echo "Network LB rule:      $NETWORK_LB_RULE"
+echo "Target pool:          $TARGET_POOL"
+echo "HTTP LB IP:           $GLOBAL_LB_IP"
 echo
- echo "Test HTTP Load Balancer:"
+ echo "Task 2 test:"
+echo "  curl http://$NETWORK_LB_IP"
+echo
+ echo "Task 3 test:"
 echo "  curl http://$GLOBAL_LB_IP"
 echo
- echo "If the lab asks for progress checks, click Check my progress"
-echo "after each task."
+ echo "Now click 'Check my progress' in the lab for each task."
 echo "============================================================"
