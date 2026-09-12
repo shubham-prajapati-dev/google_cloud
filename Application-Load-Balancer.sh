@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-REGION="europe-west4"
-ZONE="europe-west4-a"
+REGION="europe-west1"
+ZONE="europe-west1-c"
 
 echo "==> Setting default region and zone..."
 gcloud config set compute/region "$REGION"
