@@ -1,28 +1,33 @@
 #!/bin/bash
 set -euo pipefail
 
-# Google Cloud Skills Boost Challenge Lab:
-# Create multiple web servers + Network Load Balancer + HTTP Load Balancer
-#
-# The challenge lab supplies REGION and ZONE dynamically. This script accepts
-# them as arguments or uses the current gcloud compute region/zone settings.
-# Usage:
-#   ./Network-Load-Balancer-Challenge-Lab.sh REGION ZONE
-# Example:
-#   ./Network-Load-Balancer-Challenge-Lab.sh us-central1 us-central1-a
+# Google Cloud Skills Boost Challenge Lab
+# Interactive setup: asks for Region, Zone, and Debian image family.
 
-REGION="${1:-$(gcloud config get-value compute/region 2>/dev/null)}"
-ZONE="${2:-$(gcloud config get-value compute/zone 2>/dev/null)}"
+echo "============================================================"
+echo " Google Cloud Load Balancing Challenge Lab"
+echo "============================================================"
 
-if [[ -z "$REGION" || "$REGION" == "(unset)" || -z "$ZONE" || "$ZONE" == "(unset)" ]]; then
-  echo "ERROR: Region and Zone are required."
-  echo "Usage: $0 REGION ZONE"
-  echo "Example: $0 us-central1 us-central1-a"
-  exit 1
-fi
+default_region="$(gcloud config get-value compute/region 2>/dev/null || true)"
+default_zone="$(gcloud config get-value compute/zone 2>/dev/null || true)"
 
-IMAGE_FAMILY="debian-12"
+[[ "$default_region" == "(unset)" ]] && default_region=""
+[[ "$default_zone" == "(unset)" ]] && default_zone=""
+
+default_region="${default_region:-us-central1}"
+default_zone="${default_zone:-us-central1-a}"
+
+read -r -p "Enter Region [$default_region]: " REGION
+REGION="${REGION:-$default_region}"
+
+read -r -p "Enter Zone [$default_zone]: " ZONE
+ZONE="${ZONE:-$default_zone}"
+
+read -r -p "Enter Debian image family [debian-12]: " IMAGE_FAMILY
+IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
+
 IMAGE_PROJECT="debian-cloud"
+NETWORK="default"
 
 NETWORK_LB_IP_NAME="network-lb-ip-1"
 TARGET_POOL="www-pool"
@@ -38,28 +43,32 @@ HTTP_PROXY="http-lb-proxy"
 FORWARDING="http-content-rule"
 
 run_create() {
-  "$@" || {
-    echo "Command failed (resource may already exist); continuing..."
+  if "$@"; then
     return 0
-  }
+  fi
+  echo "Resource/command may already exist; continuing..."
+  return 0
 }
 
-echo "============================================================"
-echo "Region: $REGION"
-echo "Zone:   $ZONE"
-echo "============================================================"
+echo
+printf '%s\n' "Region: $REGION"
+printf '%s\n' "Zone:   $ZONE"
+printf '%s\n' "Image:  $IMAGE_FAMILY ($IMAGE_PROJECT)"
+printf '%s\n' "Network: $NETWORK"
+echo
+read -r -p "Continue with these values? [Y/n]: " CONFIRM
+CONFIRM="${CONFIRM:-Y}"
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
 
 gcloud config set compute/region "$REGION"
 gcloud config set compute/zone "$ZONE"
 
-# ------------------------------------------------------------
 # TASK 1: Three web servers
-# ------------------------------------------------------------
 create_web_vm() {
   local name="$1"
   run_create gcloud compute instances create "$name" \
     --zone="$ZONE" \
-    --network=default \
+    --network="$NETWORK" \
     --tags=network-lb-tag \
     --machine-type=e2-small \
     --image-family="$IMAGE_FAMILY" \
@@ -76,13 +85,11 @@ create_web_vm web2
 create_web_vm web3
 
 run_create gcloud compute firewall-rules create "$FW_NETWORK_LB" \
-  --network=default \
+  --network="$NETWORK" \
   --target-tags=network-lb-tag \
   --allow=tcp:80
 
-# ------------------------------------------------------------
-# TASK 2: Network Load Balancing service
-# ------------------------------------------------------------
+# TASK 2: Network Load Balancer
 run_create gcloud compute addresses create "$NETWORK_LB_IP_NAME" \
   --region="$REGION"
 
@@ -105,12 +112,10 @@ run_create gcloud compute forwarding-rules create "$TARGET_POOL-forwarding-rule"
   --address="$NETWORK_LB_IP_NAME" \
   --target-pool="$TARGET_POOL"
 
-# ------------------------------------------------------------
 # TASK 3: HTTP Load Balancer
-# ------------------------------------------------------------
 run_create gcloud compute instance-templates create "$TEMPLATE" \
   --region="$REGION" \
-  --network=default \
+  --network="$NETWORK" \
   --subnet=default \
   --tags=allow-health-check \
   --machine-type=e2-medium \
@@ -131,7 +136,7 @@ run_create gcloud compute instance-groups managed create "$MIG" \
   --zone="$ZONE"
 
 run_create gcloud compute firewall-rules create "$FW_HEALTH" \
-  --network=default \
+  --network="$NETWORK" \
   --action=allow \
   --direction=ingress \
   --source-ranges=130.211.0.0/22,35.191.0.0/16 \
@@ -174,10 +179,17 @@ run_create gcloud compute forwarding-rules create "$FORWARDING" \
   --ports=80
 
 echo
-printf '%s\n' '============================================================'
-printf '%s\n' 'Challenge lab resources created.'
-printf '%s\n' "Network LB IP: $NETWORK_LB_IP"
-printf '%s\n' "HTTP LB IP:    $GLOBAL_LB_IP"
-printf '%s\n' 'Test HTTP LB with:'
-printf '%s\n' "curl http://$GLOBAL_LB_IP"
-printf '%s\n' '============================================================'
+echo "============================================================"
+echo " Challenge Lab setup complete"
+echo "============================================================"
+echo "Region:              $REGION"
+echo "Zone:                $ZONE"
+echo "Network LB IP:       $NETWORK_LB_IP"
+echo "HTTP Load Balancer:  $GLOBAL_LB_IP"
+echo
+ echo "Test HTTP Load Balancer:"
+echo "  curl http://$GLOBAL_LB_IP"
+echo
+ echo "If the lab asks for progress checks, click Check my progress"
+echo "after each task."
+echo "============================================================"
