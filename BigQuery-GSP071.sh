@@ -3,8 +3,10 @@ set -Eeuo pipefail
 trap 'echo "ERROR at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # GSP071 - BigQuery: Qwik Start - Command Line
-# Automates Tasks 1, 2, 3, 4 and 5.
-# Task 7 cleanup is intentionally skipped so progress checks can verify the resources.
+# Automates the lab tasks that have progress checks: Tasks 1, 3, 4 and 5.
+# Task 2 (bq help query) is informational and is skipped because newer bq
+# versions can return a non-zero status for the help command.
+# Task 7 cleanup is skipped so the progress checks can verify the resources.
 
 PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
 if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
@@ -23,18 +25,12 @@ echo "============================================================"
 echo "Project: $PROJECT_ID"
 echo
 
-echo "[1/5] Examining Shakespeare table..."
+echo "[1/4] Examining Shakespeare table..."
 bq show bigquery-public-data:samples.shakespeare
 
 echo
 
-echo "[2/5] Showing bq query help..."
-# Some Cloud Shell bq versions return a non-zero status for help output.
-# The lab task is to invoke the help command, so do not fail the script here.
-bq help query || true
-echo
-
-echo "[3/5] Running raisin query..."
+echo "[2/4] Running raisin query..."
 bq query --use_legacy_sql=false \
 'SELECT
   word,
@@ -48,7 +44,7 @@ GROUP BY
 
 echo
 
-echo "[3/5] Running huzzah query..."
+echo "[2/4] Running huzzah query..."
 bq query --use_legacy_sql=false \
 'SELECT
   word
@@ -59,7 +55,7 @@ WHERE
 
 echo
 
-echo "[4/5] Creating babynames dataset..."
+echo "[3/4] Creating babynames dataset..."
 if bq show --format=none "$DATASET" >/dev/null 2>&1; then
   echo "  Dataset $DATASET already exists"
 else
@@ -95,7 +91,7 @@ echo
 bq show "$DATASET.$TABLE"
 echo
 
-echo "[5/5] Querying custom table..."
+echo "[4/4] Querying custom table..."
 echo "Top 5 girls names:"
 bq query --use_legacy_sql=false \
 "SELECT name,count FROM \`$DATASET.$TABLE\` WHERE gender = 'F' ORDER BY count DESC LIMIT 5"
