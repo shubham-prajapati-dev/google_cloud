@@ -4,11 +4,10 @@ trap 'echo "ERROR at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # GSP071 - BigQuery: Qwik Start - Command Line
 # Automates Tasks 1, 2, 3, 4 and 5.
-# Does NOT run Task 7 cleanup because deleting babynames would remove the
-# resources required for the lab progress checks.
+# Task 7 cleanup is intentionally skipped so progress checks can verify the resources.
 
 PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
-if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" ]]; then
+if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
   echo "ERROR: No active Google Cloud project."
   exit 1
 fi
@@ -18,12 +17,9 @@ TABLE="names2010"
 ZIP="names.zip"
 FILE="yob2010.txt"
 
-cat <<'BANNER'
-============================================================
- GSP071 - BigQuery: Qwik Start - Command Line
-============================================================
-BANNER
-
+echo "============================================================"
+echo " GSP071 - BigQuery: Qwik Start - Command Line"
+echo "============================================================"
 echo "Project: $PROJECT_ID"
 echo
 
@@ -32,10 +28,10 @@ bq show bigquery-public-data:samples.shakespeare
 
 echo
 
-echo "[2/5] Showing bq help..."
-bq help query >/dev/null
-echo "  bq help query completed"
-
+echo "[2/5] Showing bq query help..."
+# Some Cloud Shell bq versions return a non-zero status for help output.
+# The lab task is to invoke the help command, so do not fail the script here.
+bq help query || true
 echo
 
 echo "[3/5] Running raisin query..."
@@ -72,17 +68,17 @@ else
 fi
 
 echo
-if [[ ! -f "$ZIP" ]]; then
+if [ ! -f "$ZIP" ]; then
   echo "Downloading baby names data..."
   wget -q http://www.ssa.gov/OACT/babynames/names.zip -O "$ZIP"
 fi
 
-if [[ ! -f "$FILE" ]]; then
+if [ ! -f "$FILE" ]; then
   echo "Extracting baby names data..."
   unzip -o -q "$ZIP"
 fi
 
-if [[ ! -f "$FILE" ]]; then
+if [ ! -f "$FILE" ]; then
   echo "ERROR: $FILE was not found after extracting $ZIP."
   exit 1
 fi
@@ -111,14 +107,11 @@ bq query --use_legacy_sql=false \
 "SELECT name,count FROM \`$DATASET.$TABLE\` WHERE gender = 'M' ORDER BY count ASC LIMIT 5"
 
 echo
-
 echo "============================================================"
 echo " GSP071 automation completed"
 echo "============================================================"
 echo "Dataset: $DATASET"
 echo "Table:   $DATASET.$TABLE"
-echo
- echo "Click 'Check my progress' for Tasks 1, 3, 4 and 5."
 echo "Task 6 answers: Web UI, Command line tool, bq"
 echo "Task 7 cleanup is intentionally NOT performed."
 echo "============================================================"
